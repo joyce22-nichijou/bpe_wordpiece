@@ -52,7 +52,7 @@ def wp_preprocess(corpus: Corpus, lowercase: bool = True) -> dict[str, int]:
     for sentence in corpus:
         if lowercase:
             sentence = sentence.lower()
-        sentence = re.sub(r"[^a-z\s]", "", sentence)
+        sentence = re.sub(r"[^a-z\s]", " ", sentence)
         for word in sentence.split():
             chars = list(word)
             if not chars:
@@ -388,27 +388,49 @@ class WordPieceTokenizer(BaseTokenizer):
     # ─────────────────────────────────────────
     def tokenize(self, text: str) -> TokenList:
         """
-        Tokenize text using learned merge rules (same approach as BPE).
+        Tokenize text using greedy longest-match (standard WordPiece inference).
 
-        Steps:
-            1. wp_preprocess: split each word into "l ##o ##w ..." chars.
-            2. Apply self.merges in order (identical logic to BPE inference).
-            3. Any token not in self.vocab -> "[UNK]".
+        For each word, scan left-to-right and greedily pick the longest prefix
+        present in self.vocab.  Non-initial segments are looked up with the
+        "##" prefix.  If any position has no matching prefix (even a single
+        character), the entire word is replaced by "[UNK]".
 
-        Output tokens carry "##" for non-initial pieces, e.g.:
-            "newest" -> ["new", "##est"]  (if those merges were learned)
+        This fixes two issues with the previous BPE-style approach:
+          - merge-order inference could miss valid vocab entries
+          - unknown characters produced partial [UNK]s inside a word;
+            now the whole word becomes [UNK] (standard BERT behaviour)
         """
         if not self.is_trained:
             raise RuntimeError("Tokenizer is not trained yet; call train() first.")
 
-        word_freq  = wp_preprocess([text])
+        text = text.lower()
+        text = re.sub(r"[^a-z\s]", "", text)
         all_tokens: TokenList = []
-        for char_word in word_freq:
-            tokens = char_word.split()
-            tokens = self._apply_merges(tokens)
-            tokens = [t if t in self.vocab else "[UNK]" for t in tokens]
-            all_tokens.extend(tokens)
+        for word in text.split():
+            all_tokens.extend(self._tokenize_word(word))
         return all_tokens
+
+    def _tokenize_word(self, word: str) -> TokenList:
+        """Greedy longest-match for a single word; returns ['[UNK]'] on failure."""
+        tokens: TokenList = []
+        start = 0
+        n = len(word)
+        while start < n:
+            end = n
+            cur_substr = None
+            while start < end:
+                substr = word[start:end]
+                if start > 0:
+                    substr = "##" + substr
+                if substr in self.vocab:
+                    cur_substr = substr
+                    break
+                end -= 1
+            if cur_substr is None:
+                return ["[UNK]"]
+            tokens.append(cur_substr)
+            start = end
+        return tokens
 
     @staticmethod
     def _apply_one_merge(tokens: TokenList, pair: tuple[str, str]) -> TokenList:
@@ -559,3 +581,28 @@ if __name__ == "__main__":
         print("WordPiece merges: ", wp_tok.merges)
     except ImportError:
         print("(bpe.py not found, skipping comparison)")
+
+    # ── Block 7: Real corpus test ─────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Block 7: WordPiece trained on data/test_bpe.txt")
+    print("=" * 60)
+
+    import os
+    corpus_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "test_bpe.txt")
+    with open(corpus_path, encoding="utf-8") as _f:
+        real_corpus = [line.strip() for line in _f if line.strip()]
+
+    target_vocab = 500
+    print(f"Corpus: {len(real_corpus)} lines  |  Target vocab: {target_vocab}")
+
+    wp_real = WordPieceTokenizer()
+    wp_real.train(real_corpus, vocab_size=target_vocab, fast=True)
+    print(f"Vocab size: {len(wp_real.vocab)}  |  Merges learned: {len(wp_real.merges)}")
+
+    long_toks = sorted(wp_real.vocab, key=len, reverse=True)[:15]
+    print(f"Longest tokens (top 15): {long_toks}")
+
+    print("\nSample tokenizations:")
+    test_words = ["harpooneer", "landlord", "sleeping", "whale", "cannibal", "unknown", "whaling"]
+    for w in test_words:
+        print(f"  {w!r:>14} -> {wp_real.tokenize(w)}")

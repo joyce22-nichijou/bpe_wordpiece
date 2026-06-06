@@ -4,10 +4,11 @@ wordpiece_cn.py
 WordPiece 分词器 —— 逐行中文注释版本。
 代码与 wordpiece.py 完全一致，注释重点标注与 BPE (bpe.py) 的区别。
 
-【与BPE的三个核心区别】
+【与BPE的四个核心区别】
   ① 预处理：词内非首字符加 "##" 前缀，而非词尾加 "</w>"
   ② 打分：score(A,B) = freq(AB) / (freq(A)*freq(B))，BPE 直接用 freq(AB)
   ③ 合并：新 token = A + B[2:] (若B以"##"开头)，BPE 直接拼 A+B
+  ④ 推断：贪心最长匹配（greedy longest-match），BPE 按 merge 顺序依次应用
 """
 
 from __future__ import annotations
@@ -45,8 +46,11 @@ def wp_preprocess(corpus: Corpus, lowercase: bool = True) -> dict[str, int]:
     for sentence in corpus:
         if lowercase:
             sentence = sentence.lower()
-        # 与 BPE 相同：去标点，只保留小写字母和空格
-        sentence = re.sub(r"[^a-z\s]", "", sentence)
+        # 与 BPE 相同：把标点替换成空格，只保留小写字母和空格。
+        # 注意：必须替换成空格而非直接删除，否则破折号两侧的词会被拼接
+        # 例如 "without—within" 直接删除 → "withoutwithin"（错误的单个词）
+        #       "without—within" 替换空格 → "without within"（正确的两个词）
+        sentence = re.sub(r"[^a-z\s]", " ", sentence)
         for word in sentence.split():
             chars = list(word)
             if not chars:
@@ -413,30 +417,87 @@ class WordPieceTokenizer(BaseTokenizer):
     # ─────────────────────────────────────────
     def tokenize(self, text: str) -> TokenList:
         """
-        用训练好的合并规则对 text 进行分词（与 BPE 推断逻辑完全相同）。
+        【与BPE区别④】标准 WordPiece 贪心最长匹配推断。
 
-        步骤：
-            1. wp_preprocess：拆成 "l ##o ##w ..." 字符序列
-            2. 按 self.merges 顺序逐条应用（与 BPE 相同）
-            3. 不在词汇表里的 token -> "[UNK]"
+        对每个词从左到右逐步找词汇表中能匹配的最长前缀：
+        - 非词首片段在查找时加 "##" 前缀
+        - 若某个位置连单字符都找不到匹配 → 整词返回 ["[UNK]"]（BERT 标准行为）
+
+        【旧版问题及修复】
+        旧版按 self.merges 顺序依次应用（与 BPE 推断相同），存在两个缺陷：
+          缺陷1：merge 顺序推断可能错过词汇表中已有的更长子词
+          缺陷2：OOV 以 token 为粒度替换，导致 "unknown" →
+                 ['[UNK]', '[UNK]', '[UNK]', '[UNK]', '##o', '##w', '[UNK]']
+                 已知字符夹杂在 [UNK] 中，不符合标准行为
+          缺陷3：旧版通过 wp_preprocess 迭代，该函数对词去重，
+                 导致多词文本中重复的词只被 tokenize 一次
+
+        新版修复：
+          - 用 greedy longest-match 直接在词汇表搜索（BERT/HuggingFace 标准）
+          - 整词级别 OOV：任意位置匹配失败 → 整词 ["[UNK]"]
+          - 直接 text.split() 保留原始词序，修复去重 bug
 
         【与BPE区别】输出 token 含 "##" 前缀（BPE 输出含 "</w>" 后缀）
-            BPE:   "newest" -> ["newest</w>"]   或  ["new", "est</w>"]
-            WP:    "newest" -> ["new", "##est"]  （## 表示非词首片段）
+            BPE:   "newest" -> ["newest</w>"]
+            WP:    "newest" -> ["newest"]（整词在词汇表中时）
         """
         if not self.is_trained:
             raise RuntimeError("Tokenizer is not trained yet; call train() first.")
 
-        # 【与BPE区别①】用 wp_preprocess 而非 preprocess
-        word_freq  = wp_preprocess([text])
+        # 预处理与训练时保持一致：小写 + 非字母替换为空格
+        text = text.lower()
+        text = re.sub(r"[^a-z\s]", " ", text)
         all_tokens: TokenList = []
-        for char_word in word_freq:
-            tokens = char_word.split()
-            tokens = self._apply_merges(tokens)   # 与 BPE 完全相同
-            # OOV 处理与 BPE 相同：不在词汇表则替换为 "[UNK]"
-            tokens = [t if t in self.vocab else "[UNK]" for t in tokens]
-            all_tokens.extend(tokens)
+        # 直接按原始顺序处理每个词，不去重（修复旧版 wp_preprocess 去重问题）
+        for word in text.split():
+            all_tokens.extend(self._tokenize_word(word))
         return all_tokens
+
+    def _tokenize_word(self, word: str) -> TokenList:
+        """
+        对单个词做贪心最长匹配分词，返回子词列表。
+
+        算法步骤：
+            start = 0
+            while start < len(word):
+                end = len(word)        # 从最长前缀开始尝试
+                while start < end:
+                    substr = word[start:end]
+                    if start > 0: substr = "##" + substr   # 非词首加前缀
+                    if substr in self.vocab: break         # 命中，记录并推进
+                    end -= 1                               # 缩短，继续尝试
+                if end == start:                           # 连单字符都没命中
+                    return ["[UNK]"]                       # 整词失败
+                tokens.append(substr); start = end
+
+        为什么不能用旧版（按 merge 顺序应用）？
+            merge 顺序反映训练时的合并历史，推断时某些更长子词可能已在词汇表
+            但因为所需的中间合并步骤顺序不同而被跳过，greedy search 可直接找到。
+
+        OOV 处理（整词 vs 逐 token）：
+            标准 BERT WordPiece：只要有一个位置无法匹配（哪怕单字符），
+            整个词返回 ["[UNK]"]，而不是把失败位置替换成 "[UNK]" 继续处理。
+        """
+        tokens: TokenList = []
+        start = 0
+        n = len(word)
+        while start < n:
+            end = n
+            cur_substr = None
+            while start < end:
+                substr = word[start:end]
+                if start > 0:
+                    substr = "##" + substr   # 非词首片段加 ## 前缀后查词汇表
+                if substr in self.vocab:
+                    cur_substr = substr      # 命中：记录当前子词
+                    break
+                end -= 1                     # 未命中：缩短前缀，重试
+            if cur_substr is None:
+                # 该位置连单字符都不在词汇表 → 整词是 OOV
+                return ["[UNK]"]
+            tokens.append(cur_substr)
+            start = end                      # 从匹配结束处继续
+        return tokens
 
     @staticmethod
     def _apply_one_merge(tokens: TokenList, pair: tuple[str, str]) -> TokenList:
@@ -580,3 +641,32 @@ if __name__ == "__main__":
         print("  WP  优先合并高分对（##s+##t 因为几乎总是同时出现而先合并）")
     except ImportError:
         print("(bpe.py 未找到，跳过对比)")
+
+    # ── Block 6: 真实语料测试 ─────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Block 6: WordPiece 在 data/test_bpe.txt 上训练")
+    print("=" * 60)
+
+    import os
+    # 用脚本所在目录拼接路径，避免工作目录不同导致找不到文件
+    corpus_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "test_bpe.txt")
+    with open(corpus_path, encoding="utf-8") as _f:
+        # 去掉空行，每行作为一句话送入语料库
+        real_corpus = [line.strip() for line in _f if line.strip()]
+
+    target_vocab = 500
+    print(f"语料: {len(real_corpus)} 行  |  目标词汇表大小: {target_vocab}")
+
+    # 使用 fast=True（堆 + 增量更新）加速训练
+    wp_real = WordPieceTokenizer()
+    wp_real.train(real_corpus, vocab_size=target_vocab, fast=True)
+    print(f"词汇表大小: {len(wp_real.vocab)}  |  学到的合并规则数: {len(wp_real.merges)}")
+
+    # 最长 token 反映了算法学到了哪些有意义的长子词
+    long_toks = sorted(wp_real.vocab, key=len, reverse=True)[:15]
+    print(f"最长的 token（前 15 个）: {long_toks}")
+
+    print("\n示例分词结果（使用贪心最长匹配）：")
+    test_words = ["harpooneer", "landlord", "sleeping", "whale", "cannibal", "unknown", "whaling"]
+    for w in test_words:
+        print(f"  {w!r:>14} -> {wp_real.tokenize(w)}")

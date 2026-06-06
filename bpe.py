@@ -446,3 +446,28 @@ if __name__ == "__main__":
     # (c) tokenize also works on the Fast-trained model.
     sample = "abcfgh"
     print(f"\n  fast.tokenize({sample!r}) -> {f2.tokenize(sample)}")
+
+    # ── Block 5: Real corpus test ─────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("Block 5: BPE trained on data/test_bpe.txt")
+    print("=" * 60)
+
+    import os
+    corpus_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "test_bpe.txt")
+    with open(corpus_path, encoding="utf-8") as _f:
+        real_corpus = [line.strip() for line in _f if line.strip()]
+
+    target_vocab = 500
+    print(f"Corpus: {len(real_corpus)} lines  |  Target vocab: {target_vocab}")
+
+    bpe_real = BPETokenizer()
+    bpe_real.train(real_corpus, vocab_size=target_vocab, fast=True)
+    print(f"Vocab size: {len(bpe_real.vocab)}  |  Merges learned: {len(bpe_real.merges)}")
+
+    long_toks = sorted(bpe_real.vocab, key=len, reverse=True)[:15]
+    print(f"Longest tokens (top 15): {long_toks}")
+
+    print("\nSample tokenizations:")
+    test_words = ["harpooneer", "landlord", "sleeping", "whale", "cannibal", "unknown", "whaling"]
+    for w in test_words:
+        print(f"  {w!r:>14} -> {bpe_real.tokenize(w)}")

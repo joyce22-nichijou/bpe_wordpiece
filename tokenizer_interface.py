@@ -53,8 +53,8 @@ def preprocess(corpus: Corpus, lowercase: bool = True) -> dict[str, int]:
     for sentence in corpus:
         if lowercase:
             sentence = sentence.lower()
-        # 去掉标点，只保留字母和空格
-        sentence = re.sub(r"[^a-z\s]", "", sentence)
+        # 把标点替换成空格（直接删除会把相邻词拼在一起，如 without—within → withoutwithin）
+        sentence = re.sub(r"[^a-z\s]", " ", sentence)
         for word in sentence.split():
             # 字符之间加空格，词尾加</w>
             char_word = " ".join(list(word)) + " </w>"
