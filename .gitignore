@@ -1,3 +1,11 @@
 .DS_Store
 __pycache__/
 *.pyc
+corpus_gutenberg_600books.txt
+corpus_gutenberg_1200books.txt
+corpus_wikitext103.txt
+wordpiece_myself.py
+
+# Generated artifacts (regenerable by running the scripts) — keep local, don't track
+vocab/
+results/

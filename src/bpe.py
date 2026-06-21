@@ -106,6 +106,7 @@ class BPETokenizer(BaseTokenizer):
         *,
         fast: bool = True,
         verbose: bool = False,
+        progress_every: int = 0,
     ) -> None:
         """
         Train BPE on the given corpus until the vocabulary reaches vocab_size.
@@ -116,14 +117,29 @@ class BPETokenizer(BaseTokenizer):
 
         Both modes produce **identical** self.vocab and self.merges
         (same content, same order).
+
+        Note: BPE has no min_frequency parameter. BPE selects pairs by
+        absolute count, so any low-frequency cutoff would be either a tail
+        truncation (irrelevant for vocab_size << corpus pair count) or a
+        speed hack with no algorithmic interpretation; we keep the API
+        algorithmically honest by leaving it out. WordPiece, whose
+        score-ratio mechanism is unsafe without an absolute-frequency
+        floor, exposes min_frequency in its own train() signature.
+
+        progress_every=N>0 prints a one-line progress update every N merges
+        (current vocab size, last pair, elapsed time, ETA). Useful for the
+        Naive trainer on real corpora where a single run can take minutes.
         """
         if fast:
-            self._train_fast(corpus, vocab_size, verbose=verbose)
+            self._train_fast(corpus, vocab_size,
+                             verbose=verbose, progress_every=progress_every)
         else:
-            self._train_naive(corpus, vocab_size, verbose=verbose)
+            self._train_naive(corpus, vocab_size,
+                              verbose=verbose, progress_every=progress_every)
 
     # ── Naive training: rescans the whole corpus every round ──
-    def _train_naive(self, corpus: Corpus, vocab_size: int, verbose: bool = False) -> None:
+    def _train_naive(self, corpus: Corpus, vocab_size: int, *,
+                     verbose: bool = False, progress_every: int = 0) -> None:
         word_freq = preprocess(corpus)
 
         # Initial vocabulary = every single character (including </w>)
@@ -135,6 +151,10 @@ class BPETokenizer(BaseTokenizer):
 
         if verbose:
             print(f"[naive init] vocab_size={len(self.vocab)}")
+
+        import time as _time
+        t_start = _time.perf_counter()
+        target_new = max(1, vocab_size - len(self.vocab))
 
         while len(self.vocab) < vocab_size:
             stats = get_stats(word_freq)
@@ -156,11 +176,22 @@ class BPETokenizer(BaseTokenizer):
             if verbose:
                 print(f"[naive merge {len(self.merges):>3}] "
                       f"{best_pair} (freq={best_freq}) -> {new_token!r}")
+            elif progress_every > 0 and len(self.merges) % progress_every == 0:
+                done = len(self.merges)
+                elapsed = _time.perf_counter() - t_start
+                rate = done / elapsed if elapsed > 0 else 0
+                remaining = (target_new - done) / rate if rate > 0 else 0
+                print(f"[naive] merge {done:>5}/{target_new}  "
+                      f"vocab={len(self.vocab):>5}  "
+                      f"last={best_pair} freq={best_freq}  "
+                      f"elapsed={elapsed:>6.1f}s  ETA={remaining:>6.1f}s  "
+                      f"rate={rate:>5.1f}/s", flush=True)
 
         self.is_trained = True
 
     # ── Fast training: heapq + inverted index + incremental updates ──
-    def _train_fast(self, corpus: Corpus, vocab_size: int, verbose: bool = False) -> None:
+    def _train_fast(self, corpus: Corpus, vocab_size: int, *,
+                    verbose: bool = False, progress_every: int = 0) -> None:
         """
         Equivalent to the Naive version, but uses incremental data structures
         so that we never need to rescan the whole corpus on every round.
@@ -202,6 +233,10 @@ class BPETokenizer(BaseTokenizer):
 
         if verbose:
             print(f"[fast init] vocab_size={len(self.vocab)}, pairs={len(pair_freq)}")
+
+        import time as _time
+        t_start = _time.perf_counter()
+        target_new = max(1, vocab_size - len(self.vocab))
 
         # 4) Main loop.
         while len(self.vocab) < vocab_size:
@@ -257,6 +292,16 @@ class BPETokenizer(BaseTokenizer):
             if verbose:
                 print(f"[fast merge {len(self.merges):>3}] "
                       f"{best_pair} (freq={best_freq}) -> {new_tok!r}")
+            elif progress_every > 0 and len(self.merges) % progress_every == 0:
+                done = len(self.merges)
+                elapsed = _time.perf_counter() - t_start
+                rate = done / elapsed if elapsed > 0 else 0
+                remaining = (target_new - done) / rate if rate > 0 else 0
+                print(f"[fast]  merge {done:>5}/{target_new}  "
+                      f"vocab={len(self.vocab):>5}  "
+                      f"last={best_pair} freq={best_freq}  "
+                      f"elapsed={elapsed:>6.1f}s  ETA={remaining:>6.1f}s  "
+                      f"rate={rate:>5.1f}/s", flush=True)
 
         self.is_trained = True
 
@@ -344,121 +389,37 @@ class BPETokenizer(BaseTokenizer):
 # ─────────────────────────────────────────
 
 if __name__ == "__main__":
-    word_freq = {"l o w </w>": 3, "n e w e s t </w>": 2}
-    stats = get_stats(word_freq)
-
-    print("Input word_freq:")
-    for k, v in word_freq.items():
-        print(f"  {k!r}: {v}")
-
-    print("\nget_stats output (sorted by frequency):")
-    for pair, freq in sorted(stats.items(), key=lambda x: -x[1]):
-        print(f"  {pair}: {freq}")
-
-    # Expected counts:
-    #   "l o w </w>"      (x3) -> (l,o)=3, (o,w)=3, (w,</w>)=3
-    #   "n e w e s t </w>"(x2) -> (n,e)=2, (e,w)=2, (w,e)=2, (e,s)=2, (s,t)=2, (t,</w>)=2
-    expected = {
-        ("l", "o"): 3, ("o", "w"): 3, ("w", "</w>"): 3,
-        ("n", "e"): 2, ("e", "w"): 2, ("w", "e"): 2,
-        ("e", "s"): 2, ("s", "t"): 2, ("t", "</w>"): 2,
-    }
-    assert stats == expected, f"mismatch!\n  got:      {stats}\n  expected: {expected}"
-    print("\n[OK] get_stats matches the expected counts")
-
-    # ── Block 2: Naive train() demo ──
     print("\n" + "=" * 60)
-    print("Block 2: Naive BPE training")
-    print("=" * 60)
-    corpus = ["low low low lowest newest"]
-    bpe = BPETokenizer()
-    bpe.train(corpus, vocab_size=15, fast=False, verbose=True)
-    print(f"\nFinal vocab ({len(bpe.vocab)}): {sorted(bpe.vocab)}")
-    print(f"merges ({len(bpe.merges)}): {bpe.merges}")
-
-    # ── Block 3: tokenize demo ──
-    print("\n" + "=" * 60)
-    print("Block 3: tokenize (apply merges in order, resolves ambiguity)")
-    print("=" * 60)
-    for w in ["lowest", "newest", "low", "newer", "unknown"]:
-        print(f"  tokenize({w!r:>10}) -> {bpe.tokenize(w)}")
-
-    # Ambiguity demo: start from different "imagined" splits and apply
-    # self.merges in order; the canonical char-level start is unique.
-    print("\n— Ambiguity demo: different starting splits → final result —")
-    starts = {
-        "char-split":       ["l", "o", "w", "e", "s", "t", "</w>"],
-        "imagined-split-1": ["lo", "w", "e", "s", "t", "</w>"],   # pretend "lo" already exists
-        "imagined-split-2": ["l", "ow", "est", "</w>"],            # pretend a partial merge happened
-    }
-    results = {}
-    for name, toks in starts.items():
-        out = bpe._apply_merges(toks)
-        print(f"  {name:>18}: {toks}  ->  {out}")
-        results[name] = out
-    # Note: not all imagined splits collapse to the same final list
-    # (a non-canonical start can skip rules that needed the original chars).
-    # The point of the demo is that the **canonical char-level start** is
-    # the unique, deterministic path; once you start there, merge order
-    # alone determines the result.
-    assert bpe.tokenize("lowest") == bpe.tokenize("lowest"), "determinism check failed"
-    print("\n[OK] starting from char-level, tokenize is deterministic and unique")
-
-    # ── Block 4: Fast BPE equivalence + benchmark ──
-    print("\n" + "=" * 60)
-    print("Block 4: Fast BPE (heapq + incremental updates)")
+    print("Block 5: BPE trained on Project Gutenberg (English, vocab_size=20000)")
     print("=" * 60)
 
-    # (a) Small-corpus equivalence: vocab and merges must match Naive exactly.
-    naive = BPETokenizer(); naive.train(corpus, vocab_size=15, fast=False)
-    fast  = BPETokenizer(); fast.train(corpus,  vocab_size=15, fast=True)
-    assert naive.vocab  == fast.vocab,  f"vocab mismatch:\n  naive={naive.vocab}\n  fast ={fast.vocab}"
-    assert naive.merges == fast.merges, f"merges mismatch:\n  naive={naive.merges}\n  fast ={fast.merges}"
-    print(f"[OK] small corpus (vocab_size=15): naive.vocab == fast.vocab and naive.merges == fast.merges")
+    import json
+    from datetime import datetime
+    from pathlib import Path
+    from datasets import load_dataset
 
-    # (b) Medium-corpus benchmark — synthetic corpus so the speed gap is visible.
-    import random, time
-    random.seed(42)
-    alphabet = "abcdefghijklmnop"
-    # Build a base vocabulary of ~80 words, then build sentences from them.
-    base_words = ["".join(random.choice(alphabet) for _ in range(random.randint(3, 9)))
-                  for _ in range(80)]
-    sentences = [" ".join(random.choice(base_words) for _ in range(20)) for _ in range(100)]
-    medium_corpus = sentences
-    target_vocab = 300
+    # Project layout: this script lives in src/, data/vocab/results are siblings.
+    PROJECT_ROOT      = Path(__file__).resolve().parent.parent
+    TRAIN_RESULTS_DIR = PROJECT_ROOT / "results" / "train_results"
 
-    t0 = time.perf_counter()
-    n2 = BPETokenizer(); n2.train(medium_corpus, vocab_size=target_vocab, fast=False)
-    t_naive = time.perf_counter() - t0
+    gutenberg = load_dataset("sedthh/gutenberg_english", split="train", streaming=True)
 
-    t0 = time.perf_counter()
-    f2 = BPETokenizer(); f2.train(medium_corpus, vocab_size=target_vocab, fast=True)
-    t_fast = time.perf_counter() - t0
+    real_corpus = []
+    n_books = 600
+    for i, book in enumerate(gutenberg):
+        if i >= n_books:
+            break
+        for line in book["TEXT"].split("\n"):
+            line = line.strip()
+            if line:
+                real_corpus.append(line)
 
-    assert n2.vocab  == f2.vocab,  "medium-corpus vocab mismatch"
-    assert n2.merges == f2.merges, "medium-corpus merges mismatch"
-    speedup = t_naive / t_fast if t_fast > 0 else float("inf")
-    print(f"\n  Medium corpus: {len(medium_corpus)} sentences x 20 words, target_vocab={target_vocab}")
-    print(f"  Naive: {t_naive*1000:7.1f} ms")
-    print(f"  Fast : {t_fast*1000:7.1f} ms")
-    print(f"  [OK] vocab/merges identical; Fast speedup ~ {speedup:.1f}x")
+    import sys
+    print(f"Corpus: {len(real_corpus)} lines  |  "
+          f"estimated text size: {sum(len(l) for l in real_corpus) / 1024 / 1024:.1f} MB")
 
-    # (c) tokenize also works on the Fast-trained model.
-    sample = "abcfgh"
-    print(f"\n  fast.tokenize({sample!r}) -> {f2.tokenize(sample)}")
-
-    # ── Block 5: Real corpus test ─────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("Block 5: BPE trained on data/test_bpe.txt")
-    print("=" * 60)
-
-    import os
-    corpus_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "test_bpe.txt")
-    with open(corpus_path, encoding="utf-8") as _f:
-        real_corpus = [line.strip() for line in _f if line.strip()]
-
-    target_vocab = 500
-    print(f"Corpus: {len(real_corpus)} lines  |  Target vocab: {target_vocab}")
+    target_vocab  = 20000
+    print(f"Target vocab: {target_vocab}")
 
     bpe_real = BPETokenizer()
     bpe_real.train(real_corpus, vocab_size=target_vocab, fast=True)
@@ -467,7 +428,31 @@ if __name__ == "__main__":
     long_toks = sorted(bpe_real.vocab, key=len, reverse=True)[:15]
     print(f"Longest tokens (top 15): {long_toks}")
 
+    test_words = ["running", "landlord", "sleeping", "whale", "cannibal", "unknown",
+                  "playing", "national", "university", "international", "revolutionary",
+                  "extraordinary", "unbelievable", "preprocessing", "tokenization",
+                  "anabaptist", "counterrevolutionary", "antidisestablishmentarianism"]
     print("\nSample tokenizations:")
-    test_words = ["harpooneer", "landlord", "sleeping", "whale", "cannibal", "unknown", "whaling"]
     for w in test_words:
         print(f"  {w!r:>14} -> {bpe_real.tokenize(w)}")
+
+    # ── 导出结果（和WordPiece一致的格式，方便对比） ──────────────────────────
+    results = {
+        "timestamp":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "algorithm":      "BPE",
+        "corpus":         f"Project Gutenberg (sedthh/gutenberg_english, {n_books} books, streaming)",
+        "corpus_lines":   len(real_corpus),
+        "vocab_size":     len(bpe_real.vocab),
+        "merges_learned": len(bpe_real.merges),
+        "longest_tokens": long_toks,
+        "sample_tokenizations": {
+            w: bpe_real.tokenize(w) for w in test_words
+        }
+    }
+
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    TRAIN_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = TRAIN_RESULTS_DIR / f"bpe_results_gutenberg_vocab{target_vocab}_{timestamp_str}.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    print(f"\nResults saved to: {out_path}")
