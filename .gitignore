@@ -6,6 +6,7 @@ corpus_gutenberg_1200books.txt
 corpus_wikitext103.txt
 wordpiece_myself.py
 
-# Generated artifacts (regenerable by running the scripts) — keep local, don't track
-vocab/
-results/
+# Generated artifacts (regenerable by running the scripts) —
+# keep the folder structure (.gitkeep), ignore the generated JSON output
+vocab/**/*.json
+results/**/*.json
