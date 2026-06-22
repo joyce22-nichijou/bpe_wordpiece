@@ -11,8 +11,8 @@ Key differences from BPE (bpe.py):
      rather than BPE's raw freq(AB).
   3. Merge: new token = A + B[2:] when B starts with "##", else A + B.
      The "##" on B is absorbed; A's prefix (if any) is kept.
-  4. Inference: same merge-order approach as BPE (not greedy longest-match).
-     Output tokens carry "##" for non-initial pieces.
+  4. Inference: greedy longest-match on self.vocab (standard WordPiece / BERT).
+     Non-initial pieces carry "##"; unknown words become "[UNK]".
 """
 
 from __future__ import annotations
@@ -177,11 +177,16 @@ class WordPieceTokenizer(BaseTokenizer):
         corpus: Corpus,
         vocab_size: int,
         *,
+        min_frequency: int = 1,
         fast: bool = True,
         verbose: bool = False,
     ) -> None:
         """
         Train WordPiece on corpus until vocabulary reaches vocab_size.
+
+        min_frequency: a pair is only eligible for merging while its
+            (weighted) occurrence count is >= min_frequency. Training stops
+            early, before reaching vocab_size, once no eligible pair remains.
 
         fast=True  -> heapq + incremental updates  (~O(n log n))
         fast=False -> naive: recomputes all scores from scratch each round
@@ -189,12 +194,12 @@ class WordPieceTokenizer(BaseTokenizer):
         Both modes produce identical self.vocab and self.merges.
         """
         if fast:
-            self._train_fast(corpus, vocab_size, verbose=verbose)
+            self._train_fast(corpus, vocab_size, min_frequency=min_frequency, verbose=verbose)
         else:
-            self._train_naive(corpus, vocab_size, verbose=verbose)
+            self._train_naive(corpus, vocab_size, min_frequency=min_frequency, verbose=verbose)
 
     # ── Naive training ──────────────────────────────────────────────────
-    def _train_naive(self, corpus: Corpus, vocab_size: int, verbose: bool = False) -> None:
+    def _train_naive(self, corpus: Corpus, vocab_size: int, min_frequency: int = 1, verbose: bool = False) -> None:
         word_freq = wp_preprocess(corpus)
 
         self.vocab = set()
@@ -212,6 +217,8 @@ class WordPieceTokenizer(BaseTokenizer):
             if not pair_freq:
                 break
             scores = get_wp_scores(token_freq, pair_freq)
+            # Pairs occurring fewer than min_frequency times are not eligible.
+            scores = {p: s for p, s in scores.items() if pair_freq[p] >= min_frequency}
             if not scores:
                 break
 
@@ -233,7 +240,7 @@ class WordPieceTokenizer(BaseTokenizer):
         self.is_trained = True
 
     # ── Fast training ────────────────────────────────────────────────────
-    def _train_fast(self, corpus: Corpus, vocab_size: int, verbose: bool = False) -> None:
+    def _train_fast(self, corpus: Corpus, vocab_size: int, min_frequency: int = 1, verbose: bool = False) -> None:
         """
         Same structural optimisation as BPE's _train_fast:
             words[i]       mutable token list for word i
@@ -252,6 +259,10 @@ class WordPieceTokenizer(BaseTokenizer):
         freq_B) must match current values.  A mismatch on any snapshot means
         the score is stale — skip and pop again.  This handles both the
         numerator (pair_freq) and denominator (token_freq) going stale.
+
+        min_frequency: an otherwise-valid entry whose pf_snap < min_frequency
+        is also discarded (not eligible for merging); training stops once the
+        heap is exhausted without finding an eligible pair.
         """
         word_freq = wp_preprocess(corpus)
 
@@ -313,7 +324,7 @@ class WordPieceTokenizer(BaseTokenizer):
                 if (pair_freq.get(p, 0)    == pf_snap  and
                         token_freq.get(a, 0) == tfa_snap and
                         token_freq.get(b, 0) == tfb_snap and
-                        pf_snap > 0):
+                        pf_snap >= min_frequency):
                     best_pair = p
                     break
             if best_pair is None:
@@ -404,7 +415,7 @@ class WordPieceTokenizer(BaseTokenizer):
             raise RuntimeError("Tokenizer is not trained yet; call train() first.")
 
         text = text.lower()
-        text = re.sub(r"[^a-z\s]", "", text)
+        text = re.sub(r"[^a-z\s]", " ", text)
         all_tokens: TokenList = []
         for word in text.split():
             all_tokens.extend(self._tokenize_word(word))
@@ -455,11 +466,6 @@ class WordPieceTokenizer(BaseTokenizer):
                 i += 1
         return merged
 
-    def _apply_merges(self, tokens: TokenList) -> TokenList:
-        """Apply every rule in self.merges to tokens, in order."""
-        for pair in self.merges:
-            tokens = self._apply_one_merge(tokens, pair)
-        return tokens
 
 
 # ─────────────────────────────────────────
@@ -468,141 +474,158 @@ class WordPieceTokenizer(BaseTokenizer):
 
 if __name__ == "__main__":
 
-    # ── Block 1: wp_preprocess and scoring ──────────────────────────────
+    import json
+    import sys
+    import time
+    from datetime import datetime
+    from pathlib import Path
+
+    # ── Hyperparameters ──────────────────────────────────────────────────────
+    # corpus_name: "gutenberg" | "wikitext103"
+    # train_mode:  "fast" | "naive" | "both"
+    corpus_name   = "wikitext103"
+    train_mode    = "fast"
+    target_vocab  = 20000
+    min_frequency = 500
+    n_books       = 600          # only used when corpus_name == "gutenberg"
+
+    # ── Corpus loaders (cache to project directory on first run) ─────────────
+
+    def load_corpus_gutenberg(n_books: int) -> list[str]:
+        cache_path = Path(f"corpus_gutenberg_{n_books}books.txt")
+        if cache_path.exists():
+            print(f"Loading Gutenberg corpus from local cache: {cache_path}")
+            with open(cache_path, encoding="utf-8") as f:
+                return [line.rstrip("\n") for line in f if line.strip()]
+        print(f"Downloading {n_books} books from HuggingFace (sedthh/gutenberg_english, streaming)...")
+        from datasets import load_dataset
+        ds = load_dataset("sedthh/gutenberg_english", split="train", streaming=True)
+        lines: list[str] = []
+        for i, book in enumerate(ds):
+            if i >= n_books:
+                break
+            for line in book["TEXT"].split("\n"):
+                line = line.strip()
+                if line:
+                    lines.append(line)
+        cache_path.write_text("\n".join(lines), encoding="utf-8")
+        print(f"Saved to: {cache_path}  ({len(lines)} lines, "
+              f"{cache_path.stat().st_size / 1024 / 1024:.1f} MB)")
+        return lines
+
+    def load_corpus_wikitext103() -> list[str]:
+        cache_path = Path("corpus_wikitext103.txt")
+
+        def _keep(s: str) -> bool:
+            s = s.strip()
+            return bool(s) and not s.startswith("=")
+
+        if cache_path.exists():
+            print(f"Loading WikiText-103 corpus from local cache: {cache_path}")
+            with open(cache_path, encoding="utf-8") as f:
+                return [line.rstrip("\n") for line in f if _keep(line)]
+        print("Downloading WikiText-103 train split from HuggingFace (wikitext-103-raw-v1)...")
+        from datasets import load_dataset
+        ds = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
+        lines = [row["text"].strip() for row in ds if _keep(row["text"])]
+        cache_path.write_text("\n".join(lines), encoding="utf-8")
+        print(f"Saved to: {cache_path}  ({len(lines)} lines, "
+              f"{cache_path.stat().st_size / 1024 / 1024:.1f} MB)")
+        return lines
+
+    # ── Load corpus ──────────────────────────────────────────────────────────
+    if corpus_name == "gutenberg":
+        real_corpus = load_corpus_gutenberg(n_books)
+        corpus_desc = f"Project Gutenberg (sedthh/gutenberg_english, {n_books} books)"
+        corpus_tag  = f"gutenberg{n_books}books"
+    elif corpus_name == "wikitext103":
+        real_corpus = load_corpus_wikitext103()
+        corpus_desc = "WikiText-103 (wikitext-103-raw-v1, train split)"
+        corpus_tag  = "wikitext103"
+    else:
+        raise ValueError(f"Unknown corpus_name: {corpus_name!r}. Choose 'gutenberg' or 'wikitext103'.")
+
     print("=" * 60)
-    print("Block 1: wp_preprocess + WP scoring")
-    print("=" * 60)
-
-    corpus = ["low low low lowest newest"]
-    wf = wp_preprocess(corpus)
-    print("wp_preprocess output:")
-    for k, v in sorted(wf.items()):
-        print(f"  {k!r}: {v}")
-
-    tf = get_token_freq(wf)
-    pf = get_pair_freq(wf)
-    sc = get_wp_scores(tf, pf)
-
-    print("\nToken frequencies:")
-    for tok, cnt in sorted(tf.items()):
-        print(f"  {tok!r}: {cnt}")
-
-    print("\nPair scores (sorted descending):")
-    for pair, score in sorted(sc.items(), key=lambda x: (-x[1], x[0])):
-        print(f"  {pair}: {score:.6f}  (pair_freq={pf[pair]}, "
-              f"freq_A={tf[pair[0]]}, freq_B={tf[pair[1]]})")
-
-    # Verify the score formula for one pair
-    a, b = "##s", "##t"
-    expected_score = pf[(a, b)] / (tf[a] * tf[b])
-    assert abs(sc[(a, b)] - expected_score) < 1e-12, "score formula mismatch"
-    print(f"\n[OK] score({(a,b)}) = {pf[(a,b)]}/({tf[a]}*{tf[b]}) = {expected_score:.6f}")
-
-    # ── Block 2: Naive WP training ───────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("Block 2: Naive WordPiece training")
-    print("=" * 60)
-
-    wp = WordPieceTokenizer()
-    wp.train(corpus, vocab_size=15, fast=False, verbose=True)
-    print(f"\nFinal vocab ({len(wp.vocab)}): {sorted(wp.vocab)}")
-    print(f"merges ({len(wp.merges)}): {wp.merges}")
-
-    # ── Block 3: tokenize ────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("Block 3: tokenize")
-    print("=" * 60)
-    for w in ["lowest", "newest", "low", "newer", "unknown"]:
-        print(f"  tokenize({w!r:>10}) -> {wp.tokenize(w)}")
-
-    # ── Block 4: Naive == Fast ───────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("Block 4: Fast WordPiece — equivalence + benchmark")
-    print("=" * 60)
-
-    naive = WordPieceTokenizer(); naive.train(corpus, vocab_size=15, fast=False)
-    fast  = WordPieceTokenizer(); fast.train(corpus,  vocab_size=15, fast=True)
-    assert naive.vocab  == fast.vocab,  \
-        f"vocab mismatch:\n  naive={sorted(naive.vocab)}\n  fast ={sorted(fast.vocab)}"
-    assert naive.merges == fast.merges, \
-        f"merges mismatch:\n  naive={naive.merges}\n  fast ={fast.merges}"
-    print("[OK] small corpus (vocab_size=15): naive.vocab == fast.vocab "
-          "and naive.merges == fast.merges")
-
-    # ── Block 5: Speed benchmark ─────────────────────────────────────────
-    import random, time
-    random.seed(42)
-    alphabet   = "abcdefghijklmnop"
-    base_words = ["".join(random.choice(alphabet)
-                          for _ in range(random.randint(3, 9)))
-                  for _ in range(80)]
-    sentences  = [" ".join(random.choice(base_words) for _ in range(20))
-                  for _ in range(100)]
-    medium_corpus = sentences
-    target_vocab  = 300
-
-    t0     = time.perf_counter()
-    n2     = WordPieceTokenizer(); n2.train(medium_corpus, vocab_size=target_vocab, fast=False)
-    t_naive = time.perf_counter() - t0
-
-    t0    = time.perf_counter()
-    f2    = WordPieceTokenizer(); f2.train(medium_corpus, vocab_size=target_vocab, fast=True)
-    t_fast = time.perf_counter() - t0
-
-    assert n2.vocab  == f2.vocab,  "medium-corpus vocab mismatch"
-    assert n2.merges == f2.merges, "medium-corpus merges mismatch"
-    speedup = t_naive / t_fast if t_fast > 0 else float("inf")
-    print(f"\n  Medium corpus: {len(medium_corpus)} sentences x 20 words, "
-          f"target_vocab={target_vocab}")
-    print(f"  Naive: {t_naive*1000:7.1f} ms")
-    print(f"  Fast : {t_fast*1000:7.1f} ms")
-    print(f"  [OK] vocab/merges identical; Fast speedup ~ {speedup:.1f}x")
-
-    sample = "abcfgh"
-    print(f"\n  fast.tokenize({sample!r}) -> {f2.tokenize(sample)}")
-
-    # ── Block 6: BPE vs WP on same corpus ────────────────────────────────
-    print("\n" + "=" * 60)
-    print("Block 6: BPE vs WordPiece comparison on same corpus")
-    print("=" * 60)
-    try:
-        from bpe import BPETokenizer
-        bpe_tok = BPETokenizer()
-        bpe_tok.train(corpus, vocab_size=15, fast=False)
-        wp_tok  = WordPieceTokenizer()
-        wp_tok.train(corpus,  vocab_size=15, fast=False)
-        print(f"{'word':>12}  {'BPE':30}  {'WordPiece':30}")
-        print("-" * 78)
-        for w in ["lowest", "newest", "low", "newer", "unknown"]:
-            b = str(bpe_tok.tokenize(w))
-            p = str(wp_tok.tokenize(w))
-            print(f"  {w!r:>10}  {b:30}  {p:30}")
-        print("\nBPE merges:       ", bpe_tok.merges)
-        print("WordPiece merges: ", wp_tok.merges)
-    except ImportError:
-        print("(bpe.py not found, skipping comparison)")
-
-    # ── Block 7: Real corpus test ─────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("Block 7: WordPiece trained on data/test_bpe.txt")
+    print(f"WordPiece training  |  corpus={corpus_name}  |  "
+          f"vocab_size={target_vocab}  |  min_frequency={min_frequency}")
     print("=" * 60)
 
-    import os
-    corpus_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "test_bpe.txt")
-    with open(corpus_path, encoding="utf-8") as _f:
-        real_corpus = [line.strip() for line in _f if line.strip()]
+    print(f"Corpus size in memory: {sys.getsizeof(real_corpus) / 1024 / 1024:.1f} MB  |  "
+          f"estimated text size: {sum(len(l) for l in real_corpus) / 1024 / 1024:.1f} MB")
 
-    target_vocab = 500
-    print(f"Corpus: {len(real_corpus)} lines  |  Target vocab: {target_vocab}")
+    word_freq_g = wp_preprocess(real_corpus)
+    print(f"Lines: {len(real_corpus)}  |  "
+          f"unique words after wp_preprocess: {len(word_freq_g)}  |  "
+          f"total word occurrences: {sum(word_freq_g.values())}")
 
-    wp_real = WordPieceTokenizer()
-    wp_real.train(real_corpus, vocab_size=target_vocab, fast=True)
-    print(f"Vocab size: {len(wp_real.vocab)}  |  Merges learned: {len(wp_real.merges)}")
+    # ── Train ────────────────────────────────────────────────────────────────
+    timing: dict[str, float] = {}
+
+    def _run(fast: bool) -> WordPieceTokenizer:
+        label = "fast" if fast else "naive"
+        print(f"[{label}] training started...")
+        t0 = time.perf_counter()
+        wp = WordPieceTokenizer()
+        wp.train(real_corpus, vocab_size=target_vocab, min_frequency=min_frequency,
+                 fast=fast, verbose=False)
+        elapsed = time.perf_counter() - t0
+        timing[label] = elapsed
+        print(f"[{label}] vocab={len(wp.vocab)}  merges={len(wp.merges)}  time={elapsed:.2f}s")
+        return wp
+
+    if train_mode == "fast":
+        wp_real = _run(fast=True)
+    elif train_mode == "naive":
+        wp_real = _run(fast=False)
+    elif train_mode == "both":
+        wp_naive = _run(fast=False)
+        wp_real  = _run(fast=True)
+        print(f"speedup (naive/fast): {timing['naive'] / timing['fast']:.1f}x")
+    else:
+        raise ValueError(f"Unknown train_mode: {train_mode!r}. Choose 'fast', 'naive', or 'both'.")
 
     long_toks = sorted(wp_real.vocab, key=len, reverse=True)[:15]
     print(f"Longest tokens (top 15): {long_toks}")
 
+    test_words = ["running", "landlord", "sleeping", "whale", "cannibal", "unknown",
+                  "playing", "national", "university", "international", "revolutionary",
+                  "extraordinary", "unbelievable", "preprocessing", "tokenization",
+                  "anabaptist", "counterrevolutionary", "antidisestablishmentarianism"]
+
     print("\nSample tokenizations:")
-    test_words = ["harpooneer", "landlord", "sleeping", "whale", "cannibal", "unknown", "whaling"]
     for w in test_words:
-        print(f"  {w!r:>14} -> {wp_real.tokenize(w)}")
+        print(f"  {w!r:>30} -> {wp_real.tokenize(w)}")
+
+    # ── Save the vocab file (for wordpiece_test.py to load) ──────────────────
+    vocab_path = f"vocab_{corpus_name}_v{target_vocab}_minfreq{min_frequency}.json"
+    vocab_data = {
+        "vocab":  sorted(wp_real.vocab),
+        "merges": [list(pair) for pair in wp_real.merges],
+    }
+    with open(vocab_path, "w", encoding="utf-8") as f:
+        json.dump(vocab_data, f, ensure_ascii=False, indent=2)
+    print(f"\nVocab saved to: {vocab_path}")
+
+    # ── Export training results (timestamped run statistics) ─────────────────
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results = {
+        "timestamp":      datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "corpus":         corpus_desc,
+        "corpus_lines":   len(real_corpus),
+        "unique_words":   len(word_freq_g),
+        "total_tokens":   sum(word_freq_g.values()),
+        "train_mode":     train_mode,
+        "training_time_seconds": {k: round(v, 3) for k, v in timing.items()},
+        "vocab_size":     len(wp_real.vocab),
+        "merges_learned": len(wp_real.merges),
+        "min_frequency":  min_frequency,
+        "longest_tokens": long_toks,
+        "sample_tokenizations": {
+            w: wp_real.tokenize(w) for w in test_words
+        },
+    }
+
+    out_path = f"wp_results_{corpus_tag}_vocab{target_vocab}_minfreq{min_frequency}_{timestamp_str}.json"
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    print(f"Results saved to: {out_path}")
